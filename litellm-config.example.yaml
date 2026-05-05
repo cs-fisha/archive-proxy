@@ -1,0 +1,28 @@
+model_list:
+  - model_name: "openai/*"
+    litellm_params:
+      model: "openai/*"
+      api_base: os.environ/UPSTREAM_OPENAI_BASE
+      api_key: os.environ/UPSTREAM_API_KEY
+
+  - model_name: "anthropic/*"
+    litellm_params:
+      model: "anthropic/*"
+      api_base: os.environ/UPSTREAM_ANTHROPIC_BASE
+      api_key: os.environ/UPSTREAM_API_KEY
+
+litellm_settings:
+  check_provider_endpoint: true
+  drop_params: false
+  request_timeout: 600
+  json_logs: true
+  set_verbose: false
+
+router_settings:
+  enable_pre_call_checks: true
+  optional_pre_call_checks:
+    - encrypted_content_affinity
+
+# You can add database_url later after Postgres works.
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

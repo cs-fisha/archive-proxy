@@ -1,0 +1,28 @@
+services:
+  archive-proxy:
+    build:
+      context: .
+    container_name: archive-proxy
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    ports:
+      - "127.0.0.1:56789:8000"
+    volumes:
+      - ./archives:/data/archive
+    depends_on:
+      - litellm
+
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:main-stable
+    container_name: litellm_1
+    restart: unless-stopped
+    env_file:
+      - ./.env.litellm
+    # ports:
+    #   - "127.0.0.1:4000:4000"
+    expose:
+      - "4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]

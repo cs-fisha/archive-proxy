@@ -1,0 +1,42 @@
+# Local secrets and runtime configuration
+.env
+.env.*
+!.env.example
+!.env.litellm.example
+litellm-config.yaml
+*.local.yaml
+*.local.yml
+
+# Archive data and generated reports
+archives/
+tools/monthly_exports/
+tools/newapi_pricing.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.codex
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+*.tmp
+tmp/
+temp/
