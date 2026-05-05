@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request
@@ -22,6 +22,14 @@ ARCHIVE_MAX_INLINE_BODY_BYTES = int(os.environ.get("ARCHIVE_MAX_INLINE_BODY_BYTE
 ARCHIVE_ADD_REQUEST_ID_HEADER = os.environ.get("ARCHIVE_ADD_REQUEST_ID_HEADER", "false").lower() == "true"
 ARCHIVE_FORWARD_TIMEOUT_SECONDS = float(os.environ.get("ARCHIVE_FORWARD_TIMEOUT_SECONDS", "0"))  # 0 = no total timeout
 ARCHIVE_REDACT_HEADERS = os.environ.get("ARCHIVE_REDACT_HEADERS", "false").lower() == "true"
+ARCHIVE_STREAM_FLUSH_CHUNKS = max(1, int(os.environ.get("ARCHIVE_STREAM_FLUSH_CHUNKS", "32")))
+ARCHIVE_STREAM_FLUSH_BYTES = max(1, int(os.environ.get("ARCHIVE_STREAM_FLUSH_BYTES", str(256 * 1024))))
+ARCHIVE_SHUTDOWN_DRAIN_SECONDS = max(0.0, float(os.environ.get("ARCHIVE_SHUTDOWN_DRAIN_SECONDS", "5")))
+ARCHIVE_QUEUE_MAXSIZE = max(1, int(os.environ.get("ARCHIVE_QUEUE_MAXSIZE", "20000")))
+ARCHIVE_WRITER_WORKERS = max(1, int(os.environ.get("ARCHIVE_WRITER_WORKERS", "4")))
+ARCHIVE_INDEX_MODE = os.environ.get("ARCHIVE_INDEX_MODE", "worker").strip().lower()
+if ARCHIVE_INDEX_MODE not in {"worker", "shared"}:
+    ARCHIVE_INDEX_MODE = "worker"
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -65,7 +73,22 @@ SESSION_BODY_CANDIDATES = [
 
 app = FastAPI(title="archive-proxy", docs_url=None, redoc_url=None)
 _client: Optional[httpx.AsyncClient] = None
-_index_lock = asyncio.Lock()
+_archive_queue: Optional[asyncio.Queue] = None
+_archive_writer_tasks: set[asyncio.Task] = set()
+_archive_stats = {
+    "enqueued": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "dropped": 0,
+    "dropped_best_effort": 0,
+    "overflow_inline": 0,
+    "shutdown_drained": 0,
+    "shutdown_pending": 0,
+}
+
+
+ArchiveJob = Tuple[Callable[..., Any], Tuple[Any, ...]]
 
 
 def utc_ts() -> str:
@@ -254,11 +277,18 @@ def ensure_dirs() -> None:
 def find_or_create_session_dir(family: str, session_id: str, ts_prefix: str) -> Path:
     base = ARCHIVE_ROOT / family / "session"
     sid = safe_name(session_id)
-    matches = sorted(base.glob(f"*_{sid}"))
-    if matches:
-        return matches[0]
-    d = base / f"{ts_prefix}_{sid}"
+    d = base / sid
     d.mkdir(parents=True, exist_ok=True)
+
+    meta = d / "session.json"
+    if not meta.exists():
+        write_json(meta, {
+            "session_id": session_id,
+            "safe_session_id": sid,
+            "family": family,
+            "created_ts": ts_prefix,
+            "created_iso_ts": iso_now(),
+        })
     return d
 
 
@@ -273,26 +303,106 @@ def make_record_paths(family: str, session_id: Optional[str], ts_prefix: str, re
         "root": root,
         "req": root / f"{prefix}-req.json",
         "res": root / f"{prefix}-res.json",
+        "chunks": root / f"{prefix}-chunks.jsonl",
         "headers": root / f"{prefix}-headers.json",
     }
 
 
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
     tmp.replace(path)
 
 
-async def append_index(family: str, record: Dict[str, Any]) -> None:
+def append_line(path: Path, line: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def append_index_sync(family: str, record: Dict[str, Any]) -> None:
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-    async with _index_lock:
-        for path in [ARCHIVE_ROOT / "index.jsonl", ARCHIVE_ROOT / family / "index.jsonl"]:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
+    if ARCHIVE_INDEX_MODE == "worker":
+        pid = os.getpid()
+        paths = [
+            ARCHIVE_ROOT / f"index.{pid}.jsonl",
+            ARCHIVE_ROOT / family / f"index.{pid}.jsonl",
+        ]
+    else:
+        paths = [ARCHIVE_ROOT / "index.jsonl", ARCHIVE_ROOT / family / "index.jsonl"]
+
+    for path in paths:
+        append_line(path, line)
+
+
+def write_archive_files(files: Iterable[Tuple[Path, Any]], family: str, index_record: Optional[Dict[str, Any]]) -> None:
+    for path, obj in files:
+        write_json(path, obj)
+    if index_record is not None:
+        append_index_sync(family, index_record)
+
+
+async def archive_worker() -> None:
+    assert _archive_queue is not None
+    while True:
+        job = await _archive_queue.get()
+        if job is None:
+            _archive_queue.task_done()
+            break
+        func, args = job
+        try:
+            await asyncio.to_thread(func, *args)
+        except asyncio.CancelledError:
+            _archive_stats["cancelled"] += 1
+            raise
+        except Exception as exc:
+            _archive_stats["failed"] += 1
+            print(f"archive background job failed: {type(exc).__name__}: {exc}", flush=True)
+        else:
+            _archive_stats["completed"] += 1
+        finally:
+            _archive_queue.task_done()
+
+
+async def enqueue_archive_job(func: Callable[..., Any], *args: Any, best_effort: bool = True) -> bool:
+    if _archive_queue is None:
+        _archive_stats["dropped"] += 1
+        return False
+    job: ArchiveJob = (func, args)
+    try:
+        _archive_queue.put_nowait(job)
+    except asyncio.QueueFull:
+        if best_effort:
+            _archive_stats["dropped"] += 1
+            _archive_stats["dropped_best_effort"] += 1
+            return False
+
+        _archive_stats["overflow_inline"] += 1
+        await asyncio.to_thread(func, *args)
+    else:
+        _archive_stats["enqueued"] += 1
+    return True
+
+
+async def drain_archive_queue(timeout: float) -> None:
+    if _archive_queue is None:
+        _archive_stats["shutdown_drained"] = 0
+        _archive_stats["shutdown_pending"] = 0
+        return
+
+    before = _archive_queue.qsize()
+    try:
+        await asyncio.wait_for(_archive_queue.join(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _archive_stats["shutdown_drained"] = max(0, before - _archive_queue.qsize())
+        _archive_stats["shutdown_pending"] = _archive_queue.qsize()
+        print(f"archive shutdown drain timed out with {_archive_queue.qsize()} queued job(s)", flush=True)
+    else:
+        _archive_stats["shutdown_drained"] = before
+        _archive_stats["shutdown_pending"] = 0
 
 
 def parse_sse_from_buffer(buffer: str) -> Tuple[List[Dict[str, Any]], str]:
@@ -493,21 +603,20 @@ class Reconstructor:
 
 
 class StreamingArchiveWriter:
-    def __init__(self, path: Path, meta: Dict[str, Any], reconstructor: Reconstructor) -> None:
-        self.path = path
+    def __init__(self, chunks_path: Path, meta: Dict[str, Any], reconstructor: Reconstructor) -> None:
+        self.chunks_path = chunks_path
         self.meta = meta
         self.reconstructor = reconstructor
         self.count = 0
         self.total_bytes = 0
+        self.unflushed_chunks = 0
+        self.unflushed_bytes = 0
         self.sse_buffer = ""
         self.file = None
 
     def start(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("w", encoding="utf-8")
-        self.file.write('{"meta":')
-        json.dump(self.meta, self.file, ensure_ascii=False, separators=(",", ":"))
-        self.file.write(',"chunks":[')
+        self.chunks_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.chunks_path.open("w", encoding="utf-8")
 
     def add_chunk(self, chunk: bytes) -> None:
         assert self.file is not None
@@ -541,24 +650,30 @@ class StreamingArchiveWriter:
         if text is None:
             obj["base64"] = base64.b64encode(chunk).decode("ascii")
 
-        if self.count > 1:
-            self.file.write(",")
-        json.dump(obj, self.file, ensure_ascii=False, separators=(",", ":"))
+        self.file.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.unflushed_chunks += 1
+        self.unflushed_bytes += len(chunk)
+        if self.unflushed_chunks >= ARCHIVE_STREAM_FLUSH_CHUNKS or self.unflushed_bytes >= ARCHIVE_STREAM_FLUSH_BYTES:
+            self.flush()
+
+    def flush(self) -> None:
+        assert self.file is not None
         self.file.flush()
+        self.unflushed_chunks = 0
+        self.unflushed_bytes = 0
 
     def finish(self, status: str = "complete") -> Dict[str, Any]:
         assert self.file is not None
         summary = self.reconstructor.summary()
         tail = {
             "stream_archive_status": status,
+            "archive_status": "complete" if status == "complete" else "partial",
             "chunk_count": self.count,
             "total_stream_bytes": self.total_bytes,
             "unparsed_sse_buffer_chars": len(self.sse_buffer),
             **summary,
         }
-        self.file.write('],"summary":')
-        json.dump(tail, self.file, ensure_ascii=False, separators=(",", ":"))
-        self.file.write("}\n")
+        self.flush()
         self.file.close()
         return tail
 
@@ -572,15 +687,27 @@ def make_upstream_url(path: str, raw_query: bytes) -> str:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _client
+    global _archive_queue, _client
     ensure_dirs()
+    _archive_queue = asyncio.Queue(maxsize=ARCHIVE_QUEUE_MAXSIZE)
+    for _ in range(ARCHIVE_WRITER_WORKERS):
+        task = asyncio.create_task(archive_worker())
+        _archive_writer_tasks.add(task)
     timeout = None if ARCHIVE_FORWARD_TIMEOUT_SECONDS <= 0 else ARCHIVE_FORWARD_TIMEOUT_SECONDS
     _client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _client
+    global _archive_queue, _client
+    await drain_archive_queue(ARCHIVE_SHUTDOWN_DRAIN_SECONDS)
+    if _archive_queue is not None:
+        for _ in _archive_writer_tasks:
+            await _archive_queue.put(None)
+        if _archive_writer_tasks:
+            await asyncio.gather(*_archive_writer_tasks, return_exceptions=True)
+        _archive_writer_tasks.clear()
+        _archive_queue = None
     if _client is not None:
         await _client.aclose()
         _client = None
@@ -592,6 +719,26 @@ async def health() -> JSONResponse:
         "ok": True,
         "upstream_base_url": UPSTREAM_BASE_URL,
         "archive_root": str(ARCHIVE_ROOT),
+    })
+
+
+@app.get("/_archive/stats")
+async def stats() -> JSONResponse:
+    return JSONResponse({
+        "ok": True,
+        "pid": os.getpid(),
+        "archive_root": str(ARCHIVE_ROOT),
+        "index_mode": ARCHIVE_INDEX_MODE,
+        "stream_flush_chunks": ARCHIVE_STREAM_FLUSH_CHUNKS,
+        "stream_flush_bytes": ARCHIVE_STREAM_FLUSH_BYTES,
+        "shutdown_drain_seconds": ARCHIVE_SHUTDOWN_DRAIN_SECONDS,
+        "queue_maxsize": ARCHIVE_QUEUE_MAXSIZE,
+        "writer_workers": ARCHIVE_WRITER_WORKERS,
+        "archive_queue": {
+            **_archive_stats,
+            "queued": _archive_queue.qsize() if _archive_queue is not None else 0,
+            "writers": len(_archive_writer_tasks),
+        },
     })
 
 
@@ -636,8 +783,6 @@ async def proxy_all(full_path: str, request: Request) -> Response:
         },
         "body": body_for_archive(raw_body, content_type),
     }
-    write_json(paths["req"], req_record)
-
     upstream_resp: Optional[httpx.Response] = None
     try:
         upstream_req = _client.build_request(
@@ -657,20 +802,20 @@ async def proxy_all(full_path: str, request: Request) -> Response:
             "upstream_response_headers": None,
             "primary_header_source": "client_request_headers" if family == "openai" else "upstream_response_headers",
         }
-        write_json(paths["headers"], headers_record)
-        write_json(paths["res"], {
+        res_record = {
             "meta": {"request_id": request_id, "ts": ts_prefix, "family": family, "session_id": session_id},
             "summary": {
                 "status_code": 502,
                 "latency_ms": latency_ms,
                 "is_stream": False,
+                "archive_status": "complete",
                 "has_error": True,
                 "error": error_obj,
                 "model": model_req,
                 "usage": None,
             },
-        })
-        await append_index(family, {
+        }
+        index_record = {
             "ts": ts_prefix,
             "request_id": request_id,
             "family": family,
@@ -688,8 +833,17 @@ async def proxy_all(full_path: str, request: Request) -> Response:
             "record_dir": str(paths["root"]),
             "req_file": str(paths["req"]),
             "res_file": str(paths["res"]),
+            "chunks_file": None,
             "headers_file": str(paths["headers"]),
-        })
+            "archive_status": "complete",
+        }
+        await enqueue_archive_job(
+            write_archive_files,
+            [(paths["req"], req_record), (paths["headers"], headers_record), (paths["res"], res_record)],
+            family,
+            index_record,
+            best_effort=False,
+        )
         return JSONResponse({"error": "archive-proxy upstream error", "detail": error_obj}, status_code=502)
 
     resp_headers_lc = {k.lower(): v for k, v in upstream_resp.headers.items()}
@@ -706,8 +860,6 @@ async def proxy_all(full_path: str, request: Request) -> Response:
         # client headers and Anthropic to use upstream headers. We store both always.
         "primary_header_source": "client_request_headers" if family == "openai" else "upstream_response_headers",
     }
-    write_json(paths["headers"], headers_record)
-
     if not is_stream:
         raw_resp_body = await upstream_resp.aread()
         await upstream_resp.aclose()
@@ -727,18 +879,19 @@ async def proxy_all(full_path: str, request: Request) -> Response:
                 "status_code": upstream_resp.status_code,
                 "latency_ms": latency_ms,
                 "is_stream": False,
+                "archive_status": "complete",
             },
             "body": body_for_archive(raw_resp_body, content_type_resp),
             "summary": {
                 "status_code": upstream_resp.status_code,
                 "latency_ms": latency_ms,
                 "is_stream": False,
+                "archive_status": "complete",
                 "has_error": has_error,
                 **summary,
             },
         }
-        write_json(paths["res"], res_record)
-        await append_index(family, {
+        index_record = {
             "ts": ts_prefix,
             "request_id": request_id,
             "family": family,
@@ -757,9 +910,26 @@ async def proxy_all(full_path: str, request: Request) -> Response:
             "record_dir": str(paths["root"]),
             "req_file": str(paths["req"]),
             "res_file": str(paths["res"]),
+            "chunks_file": None,
             "headers_file": str(paths["headers"]),
-        })
+            "archive_status": "complete",
+        }
+        await enqueue_archive_job(
+            write_archive_files,
+            [(paths["req"], req_record), (paths["headers"], headers_record), (paths["res"], res_record)],
+            family,
+            index_record,
+            best_effort=True,
+        )
         return Response(content=raw_resp_body, status_code=upstream_resp.status_code, headers=response_headers, media_type=None)
+
+    await enqueue_archive_job(
+        write_archive_files,
+        [(paths["req"], req_record), (paths["headers"], headers_record)],
+        family,
+        None,
+        best_effort=False,
+    )
 
     recon = Reconstructor(family, model_req)
     stream_meta = {
@@ -772,7 +942,7 @@ async def proxy_all(full_path: str, request: Request) -> Response:
         "is_stream": True,
         "content_type": content_type_resp,
     }
-    stream_writer = StreamingArchiveWriter(paths["res"], stream_meta, recon)
+    stream_writer = StreamingArchiveWriter(paths["chunks"], stream_meta, recon)
     stream_writer.start()
 
     async def body_iter():
@@ -791,8 +961,22 @@ async def proxy_all(full_path: str, request: Request) -> Response:
             summary = stream_writer.finish(status=status)
             await upstream_resp.aclose()
             has_error = upstream_resp.status_code >= 400 or bool(summary.get("has_error")) or status != "complete"
-            # Rewrite a compact summary sidecar into index only; full chunks are already in res.json.
-            await append_index(family, {
+            res_record = {
+                "meta": {
+                    **stream_meta,
+                    "latency_ms": latency_ms,
+                    "chunks_file": str(paths["chunks"]),
+                    "archive_status": summary.get("archive_status"),
+                },
+                "summary": {
+                    "status_code": upstream_resp.status_code,
+                    "latency_ms": latency_ms,
+                    "is_stream": True,
+                    "has_error": has_error,
+                    **summary,
+                },
+            }
+            index_record = {
                 "ts": ts_prefix,
                 "request_id": request_id,
                 "family": family,
@@ -810,12 +994,21 @@ async def proxy_all(full_path: str, request: Request) -> Response:
                 "has_error": has_error,
                 "error": summary.get("error"),
                 "usage": summary.get("usage"),
+                "archive_status": summary.get("archive_status"),
                 "reconstructed_content_chars": (summary.get("reconstructed") or {}).get("content_text_chars"),
                 "reconstructed_content_sha256": (summary.get("reconstructed") or {}).get("content_text_sha256"),
                 "record_dir": str(paths["root"]),
                 "req_file": str(paths["req"]),
                 "res_file": str(paths["res"]),
+                "chunks_file": str(paths["chunks"]),
                 "headers_file": str(paths["headers"]),
-            })
+            }
+            await enqueue_archive_job(
+                write_archive_files,
+                [(paths["res"], res_record)],
+                family,
+                index_record,
+                best_effort=True,
+            )
 
     return StreamingResponse(body_iter(), status_code=upstream_resp.status_code, headers=response_headers)

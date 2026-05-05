@@ -5,7 +5,7 @@ archive_monthly_export.py
 Offline monthly exporter for archive-proxy logs.
 
 Features:
-  1) Reads archive-proxy archives/index.jsonl, or falls back to walking *-res.json.
+  1) Reads archive-proxy archives/index*.jsonl, or falls back to walking *-res.json.
   2) Computes input/output/total tokens by model.
   3) Computes New API style cost by model using a pricing JSON file.
   4) Exports reports: summary.json, by_model.csv, by_model.json, missing_pricing.csv.
@@ -43,6 +43,7 @@ ARCHIVE_TS_RE = re.compile(r"^(\d{8}T\d{6}\.\d+Z)")
 REQ_SUFFIX = "-req.json"
 RES_SUFFIX = "-res.json"
 HEADERS_SUFFIX = "-headers.json"
+CHUNKS_SUFFIX = "-chunks.jsonl"
 
 
 @dataclass
@@ -61,6 +62,8 @@ class ArchiveRecord:
     req_file: Optional[Path]
     res_file: Optional[Path]
     headers_file: Optional[Path]
+    chunks_file: Optional[Path]
+    archive_status: Optional[str] = None
     index_record: Optional[Dict[str, Any]] = None
 
 
@@ -302,72 +305,85 @@ def normalized_token_usage(usage: Dict[str, Any], include_cache_in_input: bool =
 
 
 def iter_index_records(archive_root: Path, since: Optional[datetime], until: Optional[datetime]) -> Iterator[ArchiveRecord]:
-    index_path = archive_root / "index.jsonl"
-    if not index_path.exists():
+    index_paths = sorted(archive_root.glob("index.*.jsonl"))
+    shared_index = archive_root / "index.jsonl"
+    if shared_index.exists():
+        index_paths.insert(0, shared_index)
+    if not index_paths:
         return
+
     seen: set[Tuple[str, str]] = set()
-    with index_path.open("r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception as exc:
-                eprint(f"WARN: bad index line {line_no}: {exc}")
-                continue
-            ts = str(obj.get("ts") or "")
-            if not in_range(ts, since, until):
-                continue
-            request_id = str(obj.get("request_id") or "")
-            key = (ts, request_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            req_file = resolve_archive_path(obj.get("req_file"), archive_root)
-            res_file = resolve_archive_path(obj.get("res_file"), archive_root)
-            headers_file = resolve_archive_path(obj.get("headers_file"), archive_root)
-            usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-            # Some old index records may miss usage/model; fill from res file lazily.
-            if (not usage or not obj.get("model")) and res_file and res_file.exists():
-                res_obj = load_json(res_file)
-                summary = get_summary_from_res(res_obj)
-                if not usage:
-                    usage = extract_usage_from_res(res_obj)
-                if not obj.get("model"):
-                    obj["model"] = summary.get("model")
-                if obj.get("status_code") is None:
-                    obj["status_code"] = summary.get("status_code")
-                if obj.get("has_error") is None:
-                    obj["has_error"] = summary.get("has_error")
-            if not obj.get("request_model") and req_file and req_file.exists():
-                req_obj = load_json(req_file)
-                obj["request_model"] = extract_request_model(req_obj)
-            yield ArchiveRecord(
-                ts=ts,
-                request_id=request_id,
-                family=obj.get("family"),
-                session_id=obj.get("session_id"),
-                path=obj.get("path"),
-                request_model=normalize_model_name(obj.get("request_model")),
-                model=normalize_model_name(obj.get("model") or obj.get("request_model")),
-                status_code=coerce_int(obj.get("status_code")) if obj.get("status_code") is not None else None,
-                is_stream=obj.get("is_stream"),
-                has_error=obj.get("has_error"),
-                usage=usage,
-                req_file=req_file,
-                res_file=res_file,
-                headers_file=headers_file,
-                index_record=obj,
-            )
+    for index_path in index_paths:
+        with index_path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception as exc:
+                    eprint(f"WARN: bad index line {index_path}:{line_no}: {exc}")
+                    continue
+                ts = str(obj.get("ts") or "")
+                if not in_range(ts, since, until):
+                    continue
+                request_id = str(obj.get("request_id") or "")
+                key = (ts, request_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                req_file = resolve_archive_path(obj.get("req_file"), archive_root)
+                res_file = resolve_archive_path(obj.get("res_file"), archive_root)
+                headers_file = resolve_archive_path(obj.get("headers_file"), archive_root)
+                chunks_file = resolve_archive_path(obj.get("chunks_file"), archive_root)
+                usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+                # Some old index records may miss usage/model; fill from res file lazily.
+                if (not usage or not obj.get("model")) and res_file and res_file.exists():
+                    res_obj = load_json(res_file)
+                    summary = get_summary_from_res(res_obj)
+                    if not usage:
+                        usage = extract_usage_from_res(res_obj)
+                    if not obj.get("model"):
+                        obj["model"] = summary.get("model")
+                    if obj.get("status_code") is None:
+                        obj["status_code"] = summary.get("status_code")
+                    if obj.get("has_error") is None:
+                        obj["has_error"] = summary.get("has_error")
+                if not obj.get("request_model") and req_file and req_file.exists():
+                    req_obj = load_json(req_file)
+                    obj["request_model"] = extract_request_model(req_obj)
+                yield ArchiveRecord(
+                    ts=ts,
+                    request_id=request_id,
+                    family=obj.get("family"),
+                    session_id=obj.get("session_id"),
+                    path=obj.get("path"),
+                    request_model=normalize_model_name(obj.get("request_model")),
+                    model=normalize_model_name(obj.get("model") or obj.get("request_model")),
+                    status_code=coerce_int(obj.get("status_code")) if obj.get("status_code") is not None else None,
+                    is_stream=obj.get("is_stream"),
+                    has_error=obj.get("has_error"),
+                    usage=usage,
+                    req_file=req_file,
+                    res_file=res_file,
+                    headers_file=headers_file,
+                    chunks_file=chunks_file,
+                    archive_status=obj.get("archive_status"),
+                    index_record=obj,
+                )
 
 
-def derive_sibling_paths(res_file: Path) -> Tuple[Optional[Path], Path, Optional[Path]]:
+def derive_sibling_paths(res_file: Path) -> Tuple[Optional[Path], Path, Optional[Path], Optional[Path]]:
     name = res_file.name
     if name.endswith(RES_SUFFIX):
         prefix = name[: -len(RES_SUFFIX)]
-        return res_file.with_name(prefix + REQ_SUFFIX), res_file, res_file.with_name(prefix + HEADERS_SUFFIX)
-    return None, res_file, None
+        return (
+            res_file.with_name(prefix + REQ_SUFFIX),
+            res_file,
+            res_file.with_name(prefix + HEADERS_SUFFIX),
+            res_file.with_name(prefix + CHUNKS_SUFFIX),
+        )
+    return None, res_file, None, None
 
 
 def iter_walk_records(archive_root: Path, since: Optional[datetime], until: Optional[datetime]) -> Iterator[ArchiveRecord]:
@@ -376,7 +392,7 @@ def iter_walk_records(archive_root: Path, since: Optional[datetime], until: Opti
         ts = m.group(1) if m else ""
         if ts and not in_range(ts, since, until):
             continue
-        req_file, _, headers_file = derive_sibling_paths(res_file)
+        req_file, _, headers_file, chunks_file = derive_sibling_paths(res_file)
         res_obj = load_json(res_file)
         req_obj = load_json(req_file) if req_file and req_file.exists() else None
         summary = get_summary_from_res(res_obj)
@@ -406,6 +422,8 @@ def iter_walk_records(archive_root: Path, since: Optional[datetime], until: Opti
             req_file=req_file if req_file and req_file.exists() else None,
             res_file=res_file,
             headers_file=headers_file if headers_file and headers_file.exists() else None,
+            chunks_file=chunks_file if chunks_file and chunks_file.exists() else None,
+            archive_status=summary.get("archive_status") or meta.get("archive_status"),
             index_record=None,
         )
 
@@ -477,12 +495,16 @@ def make_full_jsonl_obj(rec: ArchiveRecord, compact_files: bool = False) -> Dict
             "req_file": str(rec.req_file) if rec.req_file else None,
             "res_file": str(rec.res_file) if rec.res_file else None,
             "headers_file": str(rec.headers_file) if rec.headers_file else None,
+            "chunks_file": str(rec.chunks_file) if rec.chunks_file else None,
         },
+        "archive_status": rec.archive_status,
     }
     if not compact_files:
         obj["request"] = load_json(rec.req_file)
         obj["response"] = load_json(rec.res_file)
         obj["headers"] = load_json(rec.headers_file)
+        if rec.chunks_file:
+            obj["chunks_file"] = str(rec.chunks_file)
     return obj
 
 
@@ -529,7 +551,7 @@ def unique_existing_files(records: List[ArchiveRecord]) -> List[Path]:
     seen: set[Path] = set()
     files: List[Path] = []
     for rec in records:
-        for p in (rec.req_file, rec.res_file, rec.headers_file):
+        for p in (rec.req_file, rec.res_file, rec.headers_file, rec.chunks_file):
             if p and p.exists():
                 rp = p.resolve()
                 if rp not in seen:
@@ -597,6 +619,7 @@ def write_reports(records: List[ArchiveRecord], pricing: Dict[str, Any], out_dir
         "estimated_cost": 0.0,
         "missing_pricing": False,
         "pricing_key": None,
+        "archive_status_counts": defaultdict(int),
     })
     grand = {
         "requests": 0,
@@ -611,6 +634,8 @@ def write_reports(records: List[ArchiveRecord], pricing: Dict[str, Any], out_dir
         "billing_output_tokens": 0,
         "estimated_cost": 0.0,
         "missing_pricing_request_count": 0,
+        "archive_status_counts": defaultdict(int),
+        "missing_usage_request_count": 0,
     }
     missing: Dict[str, int] = defaultdict(int)
 
@@ -624,6 +649,11 @@ def write_reports(records: List[ArchiveRecord], pricing: Dict[str, Any], out_dir
         row["requests"] += 1
         row["errors"] += 1 if rec.has_error or (rec.status_code is not None and rec.status_code >= 400) else 0
         row["stream_requests"] += 1 if rec.is_stream else 0
+        archive_status = rec.archive_status or "unknown"
+        row["archive_status_counts"][archive_status] += 1
+        grand["archive_status_counts"][archive_status] += 1
+        if not rec.usage:
+            grand["missing_usage_request_count"] += 1
         for k in ["input_tokens", "output_tokens", "total_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "billing_input_tokens", "billing_output_tokens"]:
             row[k] += usage[k]
             grand[k] += usage[k]
@@ -647,15 +677,21 @@ def write_reports(records: List[ArchiveRecord], pricing: Dict[str, Any], out_dir
         "input_tokens", "output_tokens", "total_tokens",
         "cache_creation_input_tokens", "cache_read_input_tokens",
         "billing_input_tokens", "billing_output_tokens",
-        "estimated_cost", "missing_pricing",
+        "estimated_cost", "missing_pricing", "archive_status_counts",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for model, row in sorted(by_model.items()):
-            writer.writerow({"model": model, **row})
+            csv_row = dict(row)
+            csv_row["archive_status_counts"] = json_dumps_compact(dict(csv_row["archive_status_counts"]))
+            writer.writerow({"model": model, **csv_row})
 
-    by_model_json = {model: row for model, row in sorted(by_model.items())}
+    by_model_json = {}
+    for model, row in sorted(by_model.items()):
+        item = dict(row)
+        item["archive_status_counts"] = dict(item["archive_status_counts"])
+        by_model_json[model] = item
     (out_dir / "by_model.json").write_text(json_dumps_compact(by_model_json) + "\n", encoding="utf-8")
 
     missing_path = out_dir / "missing_pricing.csv"
@@ -665,6 +701,7 @@ def write_reports(records: List[ArchiveRecord], pricing: Dict[str, Any], out_dir
         for model, count in sorted(missing.items()):
             writer.writerow([model, count])
 
+    grand["archive_status_counts"] = dict(grand["archive_status_counts"])
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "record_count": len(records),
@@ -702,7 +739,7 @@ def main() -> None:
     parser.add_argument("--jsonl-mode", choices=["full", "summary"], default=cfg.get("jsonl_mode", "full"), help="full embeds req/res/headers JSON; summary writes index-like rows only")
     parser.add_argument("--max-part-gb", type=float, default=float(cfg.get("max_part_gb", 1.95)), help="Max part size in GB. Default 1.95 for a safe <2GB margin.")
     parser.add_argument("--zip-compression", choices=["stored", "deflated"], default=cfg.get("zip_compression", "stored"), help="stored gives more predictable part sizes; deflated is smaller but less predictable")
-    parser.add_argument("--walk", action="store_true", default=bool(cfg.get("walk", False)), help="Ignore index.jsonl and walk *-res.json instead")
+    parser.add_argument("--walk", action="store_true", default=bool(cfg.get("walk", False)), help="Ignore index*.jsonl and walk *-res.json instead")
     parser.add_argument("--include-cache-in-input", action="store_true", default=bool(cfg.get("include_cache_in_input", False)), help="Add cache_creation/cache_read tokens to billable input tokens")
     args = parser.parse_args()
 
@@ -714,7 +751,8 @@ def main() -> None:
     since = parse_date_arg(args.since) or m_since
     until = parse_date_arg(args.until) or m_until
 
-    if args.walk or not (archive_root / "index.jsonl").exists():
+    has_index = (archive_root / "index.jsonl").exists() or any(archive_root.glob("index.*.jsonl"))
+    if args.walk or not has_index:
         records = list(iter_walk_records(archive_root, since, until))
     else:
         records = list(iter_index_records(archive_root, since, until))

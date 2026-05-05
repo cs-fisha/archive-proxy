@@ -1,0 +1,43 @@
+.git
+.gitignore
+.dockerignore
+
+# Local secrets and runtime configuration
+.env
+.env.*
+litellm-config.yaml
+archive-tools.yaml
+*.local.yaml
+*.local.yml
+
+# Runtime archive data and generated reports
+archives/
+tools/monthly_exports/
+tools/newapi_pricing.json
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor, OS, logs, and temporary files
+.DS_Store
+Thumbs.db
+.codex
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+*.tmp
+tmp/
+temp/
