@@ -153,7 +153,28 @@ archives/
 
 ## 月度导出
 
-先准备价格文件：
+如果你希望每月一键运行，先准备本地配置：
+
+```bash
+cp archive-tools.example.yaml archive-tools.yaml
+```
+
+编辑 `archive-tools.yaml`，填入自己的 New API pricing 地址、归档目录、导出目录等。该文件默认被 `.gitignore` 排除，不会提交到开源仓库。
+
+配置好以后，直接运行：
+
+```bash
+python3 tools/fetch_newapi_pricing.py
+python3 tools/archive_monthly_export.py
+```
+
+`monthly_export.month` 支持：
+
+- `previous`：上一个 UTC 月，适合每月固定导出。
+- `current`：当前 UTC 月。
+- `YYYY-MM`：固定月份，例如 `2026-04`。
+
+也可以临时用命令行参数覆盖配置。先准备价格文件：
 
 ```bash
 python3 tools/fetch_newapi_pricing.py \

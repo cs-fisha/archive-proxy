@@ -4,6 +4,7 @@
 !.env.example
 !.env.litellm.example
 litellm-config.yaml
+archive-tools.yaml
 *.local.yaml
 *.local.yml
 

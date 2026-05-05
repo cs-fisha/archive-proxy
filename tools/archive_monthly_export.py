@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
+from tool_config import load_tool_config
+
 ARCHIVE_TS_RE = re.compile(r"^(\d{8}T\d{6}\.\d+Z)")
 REQ_SUFFIX = "-req.json"
 RES_SUFFIX = "-res.json"
@@ -112,6 +114,20 @@ def month_bounds(month: Optional[str]) -> Tuple[Optional[datetime], Optional[dat
     else:
         end = datetime(y, m + 1, 1, tzinfo=timezone.utc)
     return start, end
+
+
+def relative_month(value: str, now: datetime) -> str:
+    value = str(value).strip().lower()
+    if value in {"current", "this", "this_month"}:
+        return now.strftime("%Y-%m")
+    if value in {"previous", "prev", "last", "last_month"}:
+        year = now.year
+        month = now.month - 1
+        if month == 0:
+            year -= 1
+            month = 12
+        return f"{year:04d}-{month:02d}"
+    return value
 
 
 def in_range(ts: str, since: Optional[datetime], until: Optional[datetime]) -> bool:
@@ -666,19 +682,28 @@ def write_reports(records: List[ArchiveRecord], pricing: Dict[str, Any], out_dir
     return summary
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Monthly report/export tool for archive-proxy archives")
-    parser.add_argument("--archive-root", default="/home/cs/litellm/archive-proxy/archives", type=Path, help="Archive root, e.g. /opt/llm-gateway/archives")
-    parser.add_argument("--pricing", type=Path, default="./newapi_pricing.json", help="Pricing JSON file. Supports New API ratio format or USD-per-million format.")
-    parser.add_argument("--out-dir", default=f"./monthly_exports/{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H-%M-%S')}", type=Path, help="Output directory")
-    parser.add_argument("--month", default=datetime.now(timezone.utc).strftime("%Y-%m"), help="UTC month filter: YYYY-MM")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None, help="Local config YAML path. Defaults to ./archive-tools.yaml")
+    pre_args, _ = pre.parse_known_args()
+    cfg = load_tool_config(pre_args.config, "monthly_export")
+    now = datetime.now(timezone.utc)
+    default_month = relative_month(str(cfg.get("month", "previous")), now)
+    default_out_dir = str(cfg.get("out_dir", "./tools/monthly_exports/{month}"))
+    default_out_dir = default_out_dir.format(month=default_month, timestamp=now.strftime("%Y-%m-%d-%H-%M-%S"))
+
+    parser = argparse.ArgumentParser(description="Monthly report/export tool for archive-proxy archives", parents=[pre])
+    parser.add_argument("--archive-root", default=cfg.get("archive_root", "./archives"), type=Path, help="Archive root, e.g. /opt/llm-gateway/archives")
+    parser.add_argument("--pricing", type=Path, default=cfg.get("pricing", "./tools/newapi_pricing.json"), help="Pricing JSON file. Supports New API ratio format or USD-per-million format.")
+    parser.add_argument("--out-dir", default=default_out_dir, type=Path, help="Output directory. Config supports {month} and {timestamp}.")
+    parser.add_argument("--month", default=default_month, help="UTC month filter: YYYY-MM")
     parser.add_argument("--since", help="UTC lower bound, inclusive. Example: 2026-04-01 or archive ts")
     parser.add_argument("--until", help="UTC upper bound, exclusive. Example: 2026-05-01 or archive ts")
-    parser.add_argument("--mode", choices=["report", "jsonl", "zip", "all"], default="all")
-    parser.add_argument("--jsonl-mode", choices=["full", "summary"], default="full", help="full embeds req/res/headers JSON; summary writes index-like rows only")
-    parser.add_argument("--max-part-gb", type=float, default=1.95, help="Max part size in GB. Default 1.95 for a safe <2GB margin.")
-    parser.add_argument("--zip-compression", choices=["stored", "deflated"], default="stored", help="stored gives more predictable part sizes; deflated is smaller but less predictable")
-    parser.add_argument("--walk", action="store_true", help="Ignore index.jsonl and walk *-res.json instead")
-    parser.add_argument("--include-cache-in-input", action="store_true", help="Add cache_creation/cache_read tokens to billable input tokens")
+    parser.add_argument("--mode", choices=["report", "jsonl", "zip", "all"], default=cfg.get("mode", "all"))
+    parser.add_argument("--jsonl-mode", choices=["full", "summary"], default=cfg.get("jsonl_mode", "full"), help="full embeds req/res/headers JSON; summary writes index-like rows only")
+    parser.add_argument("--max-part-gb", type=float, default=float(cfg.get("max_part_gb", 1.95)), help="Max part size in GB. Default 1.95 for a safe <2GB margin.")
+    parser.add_argument("--zip-compression", choices=["stored", "deflated"], default=cfg.get("zip_compression", "stored"), help="stored gives more predictable part sizes; deflated is smaller but less predictable")
+    parser.add_argument("--walk", action="store_true", default=bool(cfg.get("walk", False)), help="Ignore index.jsonl and walk *-res.json instead")
+    parser.add_argument("--include-cache-in-input", action="store_true", default=bool(cfg.get("include_cache_in_input", False)), help="Add cache_creation/cache_read tokens to billable input tokens")
     args = parser.parse_args()
 
     archive_root = args.archive_root.resolve()

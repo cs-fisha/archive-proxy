@@ -153,7 +153,28 @@ Each request usually creates:
 
 ## Monthly Export
 
-Fetch a pricing file first:
+For one-command monthly usage, create a local config first:
+
+```bash
+cp archive-tools.example.yaml archive-tools.yaml
+```
+
+Edit `archive-tools.yaml` with your New API pricing URL, archive path, export path, and other local defaults. This file is ignored by Git and should not be committed.
+
+After that, run:
+
+```bash
+python3 tools/fetch_newapi_pricing.py
+python3 tools/archive_monthly_export.py
+```
+
+`monthly_export.month` supports:
+
+- `previous`: previous UTC month, recommended for monthly exports.
+- `current`: current UTC month.
+- `YYYY-MM`: fixed month, for example `2026-04`.
+
+You can still override config values with CLI flags when needed. Fetch a pricing file:
 
 ```bash
 python3 tools/fetch_newapi_pricing.py \

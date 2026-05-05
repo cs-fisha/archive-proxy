@@ -1,0 +1,35 @@
+# Copy this file to archive-tools.yaml and keep the real file local.
+# Both tools automatically load ./archive-tools.yaml when it exists.
+
+pricing:
+  # New API base URL or /pricing page URL.
+  url: https://your-new-api.example.com/pricing
+
+  # Where fetch_newapi_pricing.py writes the generated pricing JSON.
+  out: ./tools/newapi_pricing.json
+
+  # Optional user token for New API instances that require login for pricing.
+  # bearer: sk-your-new-api-user-token
+  # new_api_user: your-user-id
+
+  default_group: default
+  timeout: 30
+  provider_aliases: true
+  prefer_ratio_config: false
+
+monthly_export:
+  archive_root: ./archives
+  pricing: ./tools/newapi_pricing.json
+
+  # Use previous/current, or a fixed month like 2026-04.
+  month: previous
+
+  # Supports {month} and {timestamp}.
+  out_dir: ./tools/monthly_exports/{month}
+
+  mode: all
+  jsonl_mode: full
+  max_part_gb: 1.95
+  zip_compression: stored
+  walk: false
+  include_cache_in_input: false

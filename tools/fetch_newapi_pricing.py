@@ -33,6 +33,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from tool_config import load_tool_config
+
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
@@ -321,15 +323,20 @@ def fetch_and_normalize(
     raise SystemExit("Failed to fetch New API pricing. Tried:\n  " + "\n  ".join(errors))
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Fetch New API pricing and write archive_monthly_export-compatible pricing JSON.")
-    ap.add_argument("--url", "--base-url", dest="url", default="https://your-new-api.example.com/pricing", help="New API base URL or /pricing page URL, e.g. https://your-new-api.example.com/pricing")
-    ap.add_argument("--out", default="./newapi_pricing.json", help="Output pricing JSON path")
-    ap.add_argument("--bearer", "--auth-token", dest="bearer", default=None, help="Optional New API user token / API token for detailed pricing")
-    ap.add_argument("--new-api-user", default=None, help="Optional New-Api-User header")
-    ap.add_argument("--default-group", default="default", help="New API group used for cost calculation, default: default")
-    ap.add_argument("--timeout", type=float, default=30.0)
-    ap.add_argument("--no-provider-aliases", action="store_true", help="Do not add openai/<model>, anthropic/<model>, gemini/<model> aliases")
-    ap.add_argument("--prefer-ratio-config", action="store_true", help="Try /api/ratio_config before /api/pricing")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None, help="Local config YAML path. Defaults to ./archive-tools.yaml")
+    pre_args, _ = pre.parse_known_args()
+    cfg = load_tool_config(pre_args.config, "pricing")
+
+    ap = argparse.ArgumentParser(description="Fetch New API pricing and write archive_monthly_export-compatible pricing JSON.", parents=[pre])
+    ap.add_argument("--url", "--base-url", dest="url", default=cfg.get("url", "https://your-new-api.example.com/pricing"), help="New API base URL or /pricing page URL, e.g. https://your-new-api.example.com/pricing")
+    ap.add_argument("--out", default=cfg.get("out", "./tools/newapi_pricing.json"), help="Output pricing JSON path")
+    ap.add_argument("--bearer", "--auth-token", dest="bearer", default=cfg.get("bearer"), help="Optional New API user token / API token for detailed pricing")
+    ap.add_argument("--new-api-user", default=cfg.get("new_api_user"), help="Optional New-Api-User header")
+    ap.add_argument("--default-group", default=cfg.get("default_group", "default"), help="New API group used for cost calculation, default: default")
+    ap.add_argument("--timeout", type=float, default=float(cfg.get("timeout", 30.0)))
+    ap.add_argument("--no-provider-aliases", action="store_true", default=not bool(cfg.get("provider_aliases", True)), help="Do not add openai/<model>, anthropic/<model>, gemini/<model> aliases")
+    ap.add_argument("--prefer-ratio-config", action="store_true", default=bool(cfg.get("prefer_ratio_config", False)), help="Try /api/ratio_config before /api/pricing")
     ap.add_argument("--pretty", action="store_true", default=True, help="Pretty-print JSON output")
     args = ap.parse_args()
 
